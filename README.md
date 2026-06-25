@@ -1,7 +1,7 @@
 # The Diversification Question: Copula-Based Aggregation of Operational Risk Losses
 
-Author: Patrick Lefler
-Published: 2026-06-25
+Author: Patrick Lefler </br>
+Published: 2026-06-25 </br>
 Rendered: https://patrick-lefler.github.io/rQuarto_0perational_risk-copula_based_loss_aggregation_2026-06-24/
 
 ## Project Introduction
