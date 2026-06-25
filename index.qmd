@@ -1,0 +1,435 @@
+---
+title: "The Diversification Question"
+subtitle: "Copula-Based Aggregation of Operational Risk Losses"
+author: "Patrick Lefler"
+abstract: "Operational risk capital is typically estimated category by category and then summed, an approach that implicitly assumes every loss type peaks at once. This project tests that assumption using ten years of synthetic annual loss data across five categories for NexaCore Financial Technologies, built around a single engineered dependence channel: a systems outage that elevates downstream process failures within the same year. A bivariate copula fit to the one category pair carrying genuine dependence selects a Student-t copula at two degrees of freedom — modest but real co-movement, with a Kendall's tau of 0.16. Simulating the joint annual loss distribution puts diversified 99.9% Value-at-Risk at €17.5 million, against an additive sum of standalone category VaRs of €24.9 million, a 29.5% reduction; Expected Shortfall shows a comparable 33.8% reduction. Recomputing this benefit under four alternative copula families moves the estimate by roughly one percentage point, not because dependence is unimportant but because only one of five categories carries any modeled dependence at all. Most of the diversification benefit comes from summing independent risks, not from the specific copula chosen. The more useful board-level message is not which copula fits best, but how much of an aggregate capital figure's apparent precision rests on categories nobody modeled any relationship between."
+date: "2026-06-24"
+format:
+  html:
+    code-fold: true
+    code-copy: true
+    code-overflow: wrap
+    code-tools: true
+    code-summary: "Display code"
+    df-print: kable
+    embed-math: true
+    embed-resources: true
+    fig-align: center
+    fig-height: 6
+    fig-width: 10
+    highlight-style: arrow
+    lightbox: true
+    linkcolor: "#0166CC"
+    number-sections: false
+    page-layout: full
+    smooth-scroll: true
+    theme: sandstone
+    toc: true
+    toc-depth: 3
+    toc-location: right
+    toc-title: "Contents"
+execute:
+  echo: true
+  warning: false
+  message: false
+html-math-method: mathjax
+knitr:
+  opts_chunk:
+    comment: "#>"
+---
+
+```{r}
+#| label: setup
+#| include: false
+
+# ------------------------------------------------------------------------------
+# Libraries
+# ------------------------------------------------------------------------------
+library(kableExtra)   # Table formatting
+library(knitr)        # Document rendering
+library(plotly)       # Interactive chart wrapping
+library(scales)       # Axis and label formatting
+library(sessioninfo)  # Session provenance
+library(tidyverse)    # Data manipulation and ggplot2
+library(copula)       # Copula objects, referenced for pair-plot density overlays
+library(fitdistrplus) # Marginal frequency-severity fitting, referenced for diagnostics
+library(VineCopula)   # GoF diagnostics, AIC cross-check reference
+library(showtext)     # Registers Google Fonts (Roboto, Space Mono) for ggplot2 rendering
+library(sysfonts)     # Font lookup/download backend for showtext
+
+# ------------------------------------------------------------------------------
+# Font registration
+# ------------------------------------------------------------------------------
+# _brand.yml's font declarations control the Quarto HTML page's CSS-rendered
+# text (headings, body) -- they do NOT reach R's graphics device, which
+# renders ggplot2 charts as independent raster images. theme_brand() below
+# requests family = "Roboto" / "Space Mono" on every text element; if those
+# fonts aren't installed as system fonts on the rendering machine, the
+# device silently fails to draw that text at all rather than falling back
+# to a default font (this is what produced blank axis labels, legend text,
+# and data labels on first render -- the chart's external caption, which
+# Quarto renders as HTML, was unaffected, while everything baked into the
+# image itself was missing). Registering the fonts via showtext fetches them
+# from Google Fonts and makes them available to the graphics device
+# directly, independent of what's installed locally.
+#
+# NOTE: font_add_google() requires network access on first run (cached
+# locally afterward). If render environment has no internet access, remove
+# the family = "Roboto" / "Space Mono" arguments from theme_brand() below
+# and accept the system default sans font for chart-internal text instead.
+sysfonts::font_add_google("Roboto", family = "Roboto")
+sysfonts::font_add_google("Space Mono", family = "Space Mono")
+showtext::showtext_auto()
+showtext::showtext_opts(dpi = 96)
+
+# Namespace hazard: `copula` and `VineCopula` mask several dplyr verbs
+# (notably `select()`). Per established project pattern, calls to
+# select(), filter(), rename(), and mutate() are qualified explicitly
+# as dplyr:: throughout this document rather than reassigning globally.
+
+# ------------------------------------------------------------------------------
+# Brand colors
+# ------------------------------------------------------------------------------
+brand_primary   <- "#1A1A2E"
+brand_secondary <- "#16213E"
+brand_accent    <- "#0F3460"
+brand_highlight <- "#E94560"
+brand_surface   <- "#F5F5F5"
+brand_text      <- "#1A1A2E"
+brand_neutral   <- "#6E6E73"   # date-grey, from _brand.yml palette
+
+brand_palette <- c(
+  primary   = brand_primary,
+  secondary = brand_secondary,
+  accent    = brand_accent,
+  highlight = brand_highlight
+)
+
+# Category color mapping, used consistently across every chart in this
+# document. The 4-color brand palette isn't enough for 5 categories, and
+# 3 of those 4 (primary/secondary/accent) are all dark navy shades too
+# close in lightness to distinguish in a stacked chart -- confirmed
+# visually in the first render of Figure 1. Internal Fraud keeps
+# brand_primary and ICT keeps brand_accent (sufficiently distinct from
+# each other once brand_secondary is removed from the mix); Execution/
+# Process keeps brand_highlight. External Fraud and Clients & Business
+# Practices get a warm amber and a sage green respectively -- chosen to
+# round out 5 genuinely separated hues while staying in the brand's
+# muted, sophisticated register rather than introducing bright primaries.
+category_colors <- c(
+  "Internal Fraud"                     = "#1A1A2E",  # brand_primary, near-black navy
+  "External Fraud"                     = "#C08A2E",  # warm amber/gold
+  "ICT & Business Disruption"          = "#0F3460",  # brand_accent, royal blue
+  "Execution, Delivery & Process Mgmt" = "#E94560",  # brand_highlight, red/pink
+  "Clients & Business Practices"       = "#4C7A6B"   # sage/teal green
+)
+
+# ------------------------------------------------------------------------------
+# ggplot2 theme
+# ------------------------------------------------------------------------------
+theme_brand <- function(base_size = 12) {
+  theme_minimal(base_size = base_size) +
+    theme(
+      text             = element_text(family = "Roboto", color = brand_text),
+      plot.title       = element_text(family = "Roboto", face = "bold",
+                                       size = base_size + 2, color = brand_primary,
+                                       margin = margin(b = 6)),
+      plot.subtitle    = element_text(family = "Roboto", size = base_size - 1,
+                                       color = brand_neutral,
+                                       margin = margin(b = 10)),
+      plot.caption     = element_text(family = "Space Mono", size = base_size - 3,
+                                       color = brand_neutral, hjust = 0),
+      axis.title       = element_text(family = "Roboto", size = base_size - 1,
+                                       color = brand_text),
+      axis.text        = element_text(family = "Roboto", size = base_size - 2,
+                                       color = brand_neutral),
+      panel.grid.major = element_line(color = "#E5E5E5", linewidth = 0.4),
+      panel.grid.minor = element_blank(),
+      panel.background = element_rect(fill = "#FEFEFA", color = NA),
+      plot.background  = element_rect(fill = "#FEFEFA", color = NA),
+      legend.position  = "bottom",
+      legend.title     = element_text(family = "Roboto", size = base_size - 2,
+                                       face = "bold"),
+      legend.text      = element_text(family = "Roboto", size = base_size - 2),
+      strip.text       = element_text(family = "Roboto", face = "bold",
+                                       size = base_size - 1, color = brand_primary)
+    )
+}
+
+theme_set(theme_brand())
+
+# ------------------------------------------------------------------------------
+# Currency formatting helper (EUR, per established series convention --
+# see INSTRUCTIONS.md Sec 9)
+# ------------------------------------------------------------------------------
+eur <- scales::label_currency(prefix = "€", big.mark = ",", accuracy = 1)
+
+# ------------------------------------------------------------------------------
+# Load pre-computed data
+# ------------------------------------------------------------------------------
+loss_events             <- read_csv("data/loss_events.csv",             show_col_types = FALSE)
+monthly_category_losses <- read_csv("data/monthly_category_losses.csv", show_col_types = FALSE)
+annual_category_losses  <- read_csv("data/annual_category_losses.csv",  show_col_types = FALSE)
+marginal_fits           <- read_csv("data/marginal_fits.csv",           show_col_types = FALSE)
+copula_aic              <- read_csv("data/copula_aic.csv",              show_col_types = FALSE)
+pseudo_obs_df           <- read_csv("data/pseudo_obs.csv",              show_col_types = FALSE)
+vine_check              <- read_csv("data/vine_check.csv",              show_col_types = FALSE)
+standalone_var_es       <- read_csv("data/standalone_var_es.csv",       show_col_types = FALSE)
+joint_sim               <- read_csv("data/joint_sim.csv",               show_col_types = FALSE)
+var_comparison          <- read_csv("data/var_comparison.csv",          show_col_types = FALSE)
+```
+
+## Introduction
+
+Most operational risk frameworks compute capital one category at a time, then add the numbers together. Internal fraud gets its own 99.9th percentile. So does ICT disruption, execution failure, conduct risk, external fraud. The five figures are summed, and the total becomes the capital number a board signs off on. That sum is mathematically equivalent to assuming all five categories suffer their worst plausible year simultaneously, a scenario with vanishingly small probability under any model where the categories are not perfectly dependent.
+
+This project asks a narrower, more answerable question: for NexaCore Financial Technologies, how much does that assumption cost in excess capital, and how confident should anyone be in the answer? Ten years of synthetic annual loss data are constructed across five Basel-style event-type categories, with one deliberate dependence channel built in — a systems outage that elevates downstream process failures within the same year. A bivariate copula is fit to that pair, selected by AIC among five candidate families, and used to simulate the joint annual loss distribution. The diversified 99.9% Value-at-Risk on that joint distribution is then compared against the additive sum of standalone category VaRs, the implicit assumption under the silo approach described above.
+
+One clarification matters before any of the numbers below. This is an internal economic capital exercise, not a regulatory capital calculation. The Standardised Measurement Approach under CRR3/CRD6, which replaced the Advanced Measurement Approach in January 2025, computes operational risk capital from a Business Indicator Component with no loss-distribution or dependence-modeling component at all. A copula-based aggregation framework has no role under current regulatory rules. Its value is in risk appetite setting and internal capital allocation, where firms remain free to model dependence however they judge most defensible.
+
+A second clarification concerns scope rather than regulation. The marginal severity model used here is intentionally simple: lognormal, with no extreme value treatment of the tail. Tail-fitting methodology for NexaCore's loss categories was addressed in a companion project; reproducing that work here would dilute the question this analysis is actually built to answer, which is about dependence, not severity.
+
+The answer turns out to be more interesting than the project initially set out to demonstrate, and not in the direction expected.
+
+## Loss Category Design and Synthetic Data
+
+NexaCore's operational loss history is constructed across five categories adapted from Basel-style event-type taxonomies: Internal Fraud, External Fraud, ICT & Business Disruption, Execution/Delivery & Process Management, and Clients & Business Practices. The third and fifth categories carry particular weight for an EU fintech audience: conduct risk has driven some of the largest individual operational losses across the sector, and ICT disruption sits at the center of DORA's incident-reporting and resilience-testing obligations.
+
+Each category follows a compound Poisson-lognormal structure: a monthly event count drawn from a Poisson distribution, paired with a lognormal severity draw for each event. Ten years of monthly history (120 months) were simulated this way, then aggregated to annual totals. @tbl-marginal-fits shows the frequency and severity parameters fit back to that simulated history. These are the parameters a risk team would actually estimate from ten years of internal loss data, not the underlying generating values, which is the realistic vantage point this analysis takes throughout.
+
+```{r}
+#| label: tbl-marginal-fits
+#| tbl-cap: "Marginal Frequency-Severity Fits by Category (10-Year History)"
+
+marginal_fits |>
+  dplyr::mutate(
+    annual_lambda   = round(freq_lambda * 12, 1),
+    median_severity = eur(exp(sev_mu)),
+    sev_sigma       = round(sev_sigma, 2)
+  ) |>
+  dplyr::select(category, n_events, annual_lambda, median_severity, sev_sigma) |>
+  dplyr::arrange(dplyr::desc(annual_lambda)) |>
+  kable(
+    format    = "html",
+    digits    = 2,
+    col.names = c("Category", "Events (n)", "Annual Frequency (\u03bb)", "Median Severity", "Severity \u03c3")
+  ) |>
+  kable_styling(
+    bootstrap_options = c("striped", "hover", "condensed"),
+    full_width        = TRUE,
+    position          = "left",
+    font_size         = 13
+  )
+```
+
+@fig-annual-losses shows the resulting ten-year loss history by category. Clients & Business Practices dominates the total in most years, driven by a small number of large conduct events rather than steady attrition, a pattern consistent with how conduct risk losses tend to materialize in practice. Severity depth for any single category's tail is intentionally out of scope here. A companion project addresses extreme value methodology for loss severity directly, and reproducing that work here would dilute the question this analysis is built to answer.
+
+```{r}
+#| label: fig-annual-losses
+#| fig-cap: "Annual Loss by Category, 10-Year Synthetic History"
+
+p_annual_losses <- annual_category_losses |>
+  ggplot(aes(x = year, y = total_loss, fill = category)) +
+  geom_col(position = "stack") +
+  scale_fill_manual(values = category_colors) +
+  scale_y_continuous(labels = eur) +
+  scale_x_continuous(breaks = 1:10) +
+  labs(x = "Year", y = "Total Annual Loss", fill = NULL) +
+  theme_brand()
+
+p_annual_losses
+```
+
+One dependence channel is built into the simulation deliberately, and documented rather than left to emerge by chance: in any month where an ICT & Business Disruption event occurs, Execution, Delivery & Process Management draws additional events that same month, at elevated severity, representing the processing backlog and remediation cost that typically follows a systems outage. No other category pair carries any engineered relationship. The next section quantifies how strong that one designed relationship turns out to be once aggregated to an annual basis, and how confidently a copula model can recover it from ten years of history.
+
+## Copula Selection and Dependence Structure
+
+Rank-transforming the ten annual loss totals for ICT & Business Disruption and Execution, Delivery & Process Management onto a (0,1) scale isolates dependence from each category's own marginal distribution: the standard pseudo-observation approach for copula fitting. Five candidate families, Gaussian, Student-t, Clayton, Gumbel, and Frank, are then fit to those pseudo-observations by maximum pseudo-likelihood and ranked by AIC.
+
+The two series show a modest but real positive relationship: Kendall's tau of 0.16, Spearman's rho of 0.15. That is smaller than the underlying contagion mechanism might suggest. The mechanism fires in roughly three-quarters of months, but most years end up with substantial contagion exposure regardless of exactly how many months triggered it, which compresses the year-to-year dependence signal once losses are aggregated annually. A modest tau is the honest result of a dependence that operates monthly being viewed through an annual lens.
+
+```{r}
+#| label: tbl-copula-aic
+#| tbl-cap: "Candidate Copula Families Fit to the ICT-Execution Pair, Ranked by AIC"
+
+copula_aic |>
+  dplyr::select(rank, family, params, loglik, aic) |>
+  kable(
+    format    = "html",
+    digits    = 3,
+    col.names = c("Rank", "Family", "Parameter", "Log-Likelihood", "AIC")
+  ) |>
+  kable_styling(
+    bootstrap_options = c("striped", "hover", "condensed"),
+    full_width        = TRUE,
+    position          = "left",
+    font_size         = 13
+  )
+```
+
+@tbl-copula-aic ranks the five candidates. The Student-t copula at two degrees of freedom wins, though not by a wide margin: three other families sit within roughly one AIC unit, conventionally read as comparable statistical support at this sample size. Ten annual observations is not enough to be confident in any single family over its closest competitors, a limitation the conclusion returns to directly.
+
+Clayton's result is worth a specific note. Its fitted parameter is negative, implying lower-tail dependence running in the opposite direction from what the data actually shows. The family is simply a poor fit here, reflected in its last-place AIC, not an estimation error.
+
+```{r}
+#| label: fig-pseudo-obs
+#| fig-cap: "Pseudo-Observations, ICT vs. Execution/Process Annual Losses (n = 10 years)"
+
+pseudo_obs_df |>
+  ggplot(aes(x = ict_u, y = exec_u)) +
+  geom_abline(slope = 1, intercept = 0, color = "#B4B2A9", linetype = "dotted", linewidth = 0.5) +
+  geom_point(size = 3.5, color = brand_accent, alpha = 0.9) +
+  scale_x_continuous(limits = c(0, 1), expand = c(0.05, 0.05)) +
+  scale_y_continuous(limits = c(0, 1), expand = c(0.05, 0.05)) +
+  labs(
+    x       = "ICT & Business Disruption (rank-transformed)",
+    y       = "Execution/Process (rank-transformed)",
+    caption = "Dotted line marks perfect positive dependence (comonotonicity), shown for reference only."
+  ) +
+  theme_brand()
+```
+
+@fig-pseudo-obs shows the pseudo-observations directly. With ten points, no copula family can be confirmed visually beyond a general upward tilt, which is itself the point: a sample this small supports a directional read, not a confident shape read.
+
+One finding falls outside this analysis's stated scope but is worth reporting rather than hiding. A broader automated search across extreme-value families finds a Tawn type-1 copula with an AIC roughly one point better than the Student-t result above. This analysis is intentionally restricted to five standard families representative of a typical first-pass candidate set; a Tawn-based refinement is a reasonable next step but is left out of this version rather than expanding scope mid-project.
+
+## Joint Simulation and Capital Comparison
+
+```{r}
+#| label: tbl-standalone-var-es
+#| tbl-cap: "Standalone 99.9% VaR and Expected Shortfall by Category"
+
+standalone_var_es |>
+  dplyr::arrange(dplyr::desc(var_999)) |>
+  dplyr::mutate(
+    var_999 = eur(var_999),
+    es_999  = eur(es_999)
+  ) |>
+  kable(
+    format    = "html",
+    col.names = c("Category", "VaR (99.9%)", "Expected Shortfall (99.9%)")
+  ) |>
+  kable_styling(
+    bootstrap_options = c("striped", "hover", "condensed"),
+    full_width        = TRUE,
+    position          = "left",
+    font_size         = 13
+  )
+```
+
+@tbl-standalone-var-es reports each category's own 99.9% VaR and Expected Shortfall, computed independently of any dependence assumption. Two categories, Clients & Business Practices and Internal Fraud, account for 73.3% of the combined VaR total; both are independent by construction and both carry the heaviest severity tails in the portfolio, with severity σ of 1.15 and 1.19 respectively. That concentration matters for what follows.
+
+The additive approach simply sums these five figures, the implicit assumption behind a silo-by-silo capital framework. The diversified approach instead simulates the joint annual loss directly: the ICT-Execution pair is drawn through the AIC-selected Student-t copula, the remaining three categories are simulated independently, and the resulting totals are summed across 50,000 Monte Carlo iterations to build the joint annual loss distribution.
+
+```{r}
+#| label: fig-var-comparison
+#| fig-cap: "Additive vs. Diversified 99.9% VaR and Expected Shortfall"
+
+primary_comparison <- var_comparison |> dplyr::arrange(aic) |> dplyr::slice(1)
+
+comparison_df <- tibble::tibble(
+  metric   = rep(c("VaR (99.9%)", "Expected Shortfall"), each = 2),
+  approach = rep(c("Additive (Silo)", "Diversified (Copula)"), times = 2),
+  value    = c(primary_comparison$additive_var, primary_comparison$diversified_var,
+               primary_comparison$additive_es,  primary_comparison$diversified_es)
+)
+
+p_var_comparison <- comparison_df |>
+  ggplot(aes(x = metric, y = value, fill = approach)) +
+  geom_col(position = position_dodge(width = 0.7), width = 0.6) +
+  geom_text(aes(label = eur(value)), position = position_dodge(width = 0.7),
+            vjust = -0.5, size = 3.5, family = "Roboto", color = brand_text) +
+  scale_fill_manual(values = c("Additive (Silo)" = brand_neutral, "Diversified (Copula)" = brand_highlight)) +
+  scale_y_continuous(labels = eur, expand = expansion(mult = c(0, 0.15))) +
+  labs(x = NULL, y = "Annual Capital Estimate", fill = NULL) +
+  theme_brand()
+
+p_var_comparison
+```
+
+@fig-var-comparison shows the result. Additive 99.9% VaR comes to €24.9 million; the diversified figure is €17.5 million, a reduction of €7.3 million, or 29.5%. Expected Shortfall shows a similar pattern: €30.4 million additive against €20.1 million diversified, a 33.8% reduction. Both reductions are real and large enough to matter for capital planning. Whether they should be attributed mainly to the copula chosen, or to something else entirely, is the question the next section answers, and the answer is not the one this project initially expected to find.
+
+## Model Risk in the Dependence Assumption
+
+The original premise behind this section was straightforward: recompute the diversification benefit under each of the five candidate copula families and show how much the choice of dependence structure moves the answer. @tbl-sensitivity does exactly that, and the answer barely moves at all.
+
+```{r}
+#| label: tbl-sensitivity
+#| tbl-cap: "Diversification Benefit Across Candidate Copula Families"
+
+var_comparison |>
+  dplyr::arrange(aic) |>
+  dplyr::mutate(
+    diversified_var = eur(diversified_var),
+    diversified_es  = eur(diversified_es),
+    benefit_var_pct = scales::percent(benefit_var_pct, accuracy = 0.1),
+    benefit_es_pct  = scales::percent(benefit_es_pct, accuracy = 0.1)
+  ) |>
+  dplyr::select(family, aic, diversified_var, benefit_var_pct, diversified_es, benefit_es_pct) |>
+  kable(
+    format    = "html",
+    digits    = 3,
+    col.names = c("Family", "AIC", "Diversified VaR", "VaR Benefit", "Diversified ES", "ES Benefit")
+  ) |>
+  kable_styling(
+    bootstrap_options = c("striped", "hover", "condensed"),
+    full_width        = TRUE,
+    position          = "left",
+    font_size         = 13
+  )
+```
+
+VaR's diversification benefit ranges from 29.5% under the Student-t copula to 30.7% under Clayton, a spread of just over one percentage point. Expected Shortfall's benefit ranges from 33.7% to 34.1%, tighter still.
+
+```{r}
+#| label: fig-sensitivity
+#| fig-cap: "Diversified VaR Across Copula Families, Relative to the Additive Benchmark"
+
+sensitivity_plot_df <- var_comparison |>
+  dplyr::arrange(aic) |>
+  dplyr::mutate(family = factor(family, levels = family))
+
+additive_var_val <- sensitivity_plot_df$additive_var[1]
+
+p_sensitivity <- sensitivity_plot_df |>
+  ggplot(aes(x = family, y = diversified_var)) +
+  geom_hline(yintercept = additive_var_val, color = brand_neutral, linetype = "dashed", linewidth = 0.6) +
+  annotate("text", x = -Inf, y = additive_var_val,
+           label = paste("Additive benchmark:", eur(additive_var_val)),
+           hjust = -0.05, vjust = -0.6, size = 3.3, family = "Roboto", color = brand_neutral) +
+  geom_point(size = 4, color = brand_highlight) +
+  geom_text(aes(label = eur(diversified_var)), vjust = -1.4, size = 3.2, family = "Roboto", color = brand_text) +
+  scale_y_continuous(labels = eur, limits = c(0, additive_var_val * 1.1)) +
+  labs(x = NULL, y = "Diversified VaR (99.9%)") +
+  theme_brand()
+
+p_sensitivity
+```
+
+@fig-sensitivity shows why visually: all five diversified VaR estimates cluster within roughly €290,000 of each other, a small fraction of the more than €7.3 million gap separating any of them from the additive benchmark.
+
+The explanation is structural, not statistical. Only one pair of the five categories, ICT & Business Disruption and Execution/Process, carries any modeled dependence at all. The other three, including Clients & Business Practices and Internal Fraud, which together account for 73.3% of the additive VaR total, are simulated as fully independent. Most of the diversification benefit in this analysis comes from the ordinary fact that independent risks rarely all materialize at their worst simultaneously, an effect present regardless of which copula governs the one dependent pair. The copula choice only has room to matter for the minority of the loss base it actually touches.
+
+This has a practical implication worth stating directly. A risk team building a model like this one should spend comparatively little time agonizing over which copula family fits best once the AIC differences are this close, and comparatively more time confirming which category pairs genuinely carry dependence in the first place. Getting the dependence map right matters more than getting any single family's parameter exactly right.
+
+## Insights and Conclusion
+
+The capital estimate's insensitivity to copula choice is the more useful finding here than the size of the diversification benefit itself. The project set out to test how much a 99.9% VaR estimate would move across five candidate dependence structures; the answer turned out to be barely at all, a one-percentage-point spread on VaR and less on Expected Shortfall. A capital figure that swings with an untestable modeling assumption is fragile in a way that should worry a board. A figure that holds steady across five materially different assumptions is making a more defensible claim than the AIC ranking alone would suggest, precisely because so little of it depends on which family won that ranking.
+
+That stability traces to where the dependence actually lives, not to anything special about the five copula families tested. Only one pair among five categories carries any modeled relationship at all, and that pair accounts for a minority of the portfolio's total risk. Clients & Business Practices and Internal Fraud, both independent by construction, together drive nearly three-quarters of the additive capital figure. The practical consequence is a reallocation of analytical effort: confirming which category pairs genuinely move together is more consequential than fitting any one pair's copula precisely, and a risk team with limited modeling time should spend it accordingly.
+
+The model risk findings along the way are worth keeping rather than smoothing over. Clayton converged to a parameter with the wrong sign for this data, a reminder that a fitted model can return an answer without that answer meaning anything. A broader automated search outside the five tested families found a better-fitting extreme-value copula, a reminder that any fixed candidate set is a choice with consequences, documented here rather than hidden. Neither finding changes the headline numbers, but both are the kind of detail that separates a model a risk committee can trust from one that simply produced a number.
+
+This was built as an internal economic capital exercise, not a regulatory filing, and the conclusions should be read that way. The Standardised Measurement Approach governs NexaCore's actual regulatory capital and has no dependence-modeling component for this analysis to inform. What this exercise offers instead is a defensible answer to a question regulation does not ask: how much capital relief is reasonable to claim from diversification, and how confident that claim should be. At ten years of annual data, the honest answer is that the relief is real, roughly 30%, and far steadier across modeling choices than the small sample size might lead anyone to expect.
+
+## Session Information
+
+```{r}
+#| echo: false
+
+sessioninfo::session_info()
+```
+
+------------------------------------------------------------------------
+
+*Rendered with [Quarto](https://quarto.org/) and R. Core packages: `tidyverse`, `copula`, `fitdistrplus`, `VineCopula`, `kableExtra`, `scales`, `showtext`, `sessioninfo`*
